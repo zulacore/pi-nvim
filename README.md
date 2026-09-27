@@ -264,6 +264,15 @@ invalid params (and `llm.complete` when `WITH_MODEL=1`).
 It prints one `PASS`/`FAIL` line per check plus a final `RESULT: PASS|FAIL`, and
 exits non-zero when anything fails.
 
+## Health
+
+```vim
+:checkhealth pi-nvim
+```
+
+Checks libuv, the `pi` executable, the discovered sessions, the resolved
+session, and the RPC server (`rpc.capabilities` / `llm.complete`).
+
 ## License
 
 MIT
