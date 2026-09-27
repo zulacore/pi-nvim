@@ -59,6 +59,27 @@ export default function (pi: ExtensionAPI) {
   let server: net.Server | null = null;
   let socketPath: string | null = null;
   let markerFile: string | null = null;
+  let manifest: Record<string, unknown> | null = null;
+  let infoTimer: ReturnType<typeof setInterval> | null = null;
+
+  /**
+   * (Re)write the discovery manifest. Safe to call repeatedly: the nvim side
+   * relies on this file to enumerate sessions, and some environments clean
+   * files out of /tmp, so we re-create it when it goes missing.
+   */
+  function writeManifest() {
+    if (!markerFile || !manifest) return;
+    try {
+      fs.mkdirSync(SOCKETS_DIR, { recursive: true });
+      // Windows: named pipes aren't visible in the filesystem, so leave a
+      // marker file the nvim side can stat for liveness.
+      if (IS_WIN) fs.writeFileSync(markerFile, "");
+      // Write atomically so a reader never sees a truncated manifest.
+      const tmp = `${markerFile}.info.tmp`;
+      fs.writeFileSync(tmp, JSON.stringify(manifest));
+      fs.renameSync(tmp, `${markerFile}.info`);
+    } catch {}
+  }
 
   pi.on("session_start", async (_event, ctx) => {
     const cwd = ctx.cwd;
@@ -69,6 +90,12 @@ export default function (pi: ExtensionAPI) {
 
     socketPath = getSocketPath(cwd);
     markerFile = socketFilePath(cwd);
+    manifest = {
+      socket: socketPath,
+      cwd,
+      pid: process.pid,
+      startedAt: new Date().toISOString(),
+    };
 
     // Clean up stale socket/marker
     try {
@@ -105,21 +132,13 @@ export default function (pi: ExtensionAPI) {
       }
 
       // Register in sockets directory for discovery
-      try {
-        fs.mkdirSync(SOCKETS_DIR, { recursive: true });
-        // Windows: named pipes aren't visible in the filesystem, so leave a
-        // marker file the nvim side can stat for liveness.
-        if (IS_WIN) fs.writeFileSync(markerFile!, "");
-        fs.writeFileSync(
-          markerFile! + ".info",
-          JSON.stringify({
-            socket: socketPath,
-            cwd,
-            pid: process.pid,
-            startedAt: new Date().toISOString(),
-          }),
-        );
-      } catch {}
+      writeManifest();
+      // Self-heal: keep the manifest alive even if something deletes it.
+      if (infoTimer) clearInterval(infoTimer);
+      infoTimer = setInterval(() => {
+        if (markerFile && !fs.existsSync(`${markerFile}.info`)) writeManifest();
+      }, 5000);
+      if (typeof infoTimer.unref === "function") infoTimer.unref();
     });
 
     server.on("error", (err) => {
@@ -158,6 +177,11 @@ export default function (pi: ExtensionAPI) {
   }
 
   function cleanup() {
+    if (infoTimer) {
+      clearInterval(infoTimer);
+      infoTimer = null;
+    }
+    manifest = null;
     if (server) {
       server.close();
       server = null;
@@ -178,6 +202,9 @@ export default function (pi: ExtensionAPI) {
     } catch {}
     try {
       if (markerFile) fs.unlinkSync(markerFile + ".info");
+    } catch {}
+    try {
+      if (markerFile) fs.unlinkSync(markerFile + ".info.tmp");
     } catch {}
   }
 

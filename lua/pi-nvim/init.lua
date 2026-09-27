@@ -75,6 +75,109 @@ function M.setup(opts)
   end, { desc = "List running pi sessions" })
 end
 
+--- Parse the pid out of a "<hash>-<pid>.sock" filename.
+--- @param sock_path string
+--- @return string|nil
+local function pid_from_sock(sock_path)
+  local base = sock_path:match("([^/]+)%.sock$")
+  if not base then return nil end
+  return base:match("%-(%d+)$")
+end
+
+--- Read and decode the optional sidecar manifest for a socket.
+--- @param sock_path string
+--- @return table|nil
+local function read_manifest(sock_path)
+  local ok, content = pcall(vim.fn.readfile, sock_path .. ".info")
+  if ok and content and content[1] then
+    local parsed_ok, info = pcall(vim.json.decode, content[1])
+    if parsed_ok and type(info) == "table" then
+      return info
+    end
+  end
+  return nil
+end
+
+--- Best-effort cwd lookup for a pid (Linux only; nil elsewhere).
+--- @param pid string|nil
+--- @return string|nil
+local function cwd_for_pid(pid)
+  if not pid then return nil end
+  local ok, resolved = pcall(vim.uv.fs_readlink, "/proc/" .. pid .. "/cwd")
+  if ok and resolved then return resolved end
+  return nil
+end
+
+--- Whether a pid is definitely dead. Returns nil when it can't be told.
+--- @param pid string|nil
+--- @return boolean|nil
+local function pid_dead(pid)
+  if not pid or vim.fn.has("linux") ~= 1 then return nil end
+  return vim.uv.fs_stat("/proc/" .. pid) == nil
+end
+
+--- Discover every live pi session by scanning the sockets directory.
+---
+--- The socket file is the source of truth: on unix it is the listening socket,
+--- on Windows a liveness marker. The .info manifest is only used to enrich
+--- metadata, so sessions stay visible even if the manifest is missing.
+--- @return table[] list of { socket, cwd, pid, started, mtime }
+function M.discover_sessions()
+  local sd = sockets_dir()
+  if not sd then return {} end
+
+  local sessions = {}
+  local seen = {}
+
+  local function add(sock_file)
+    if seen[sock_file] then return end
+    local stat = vim.uv.fs_stat(sock_file)
+    if not stat then return end
+    seen[sock_file] = true
+
+    local info = read_manifest(sock_file)
+    local pid = (info and info.pid) or pid_from_sock(sock_file)
+    if pid_dead(pid) then return end
+
+    -- The connect address comes from the manifest when present (needed for
+    -- Windows named pipes), otherwise derive it from the socket filename.
+    local addr = info and info.socket
+    if not addr then
+      local base = sock_file:match("([^/]+)%.sock$")
+      if base and vim.fn.has("win32") == 1 then
+        addr = "\\\\.\\pipe\\pi-nvim-" .. base
+      else
+        addr = sock_file
+      end
+    end
+
+    table.insert(sessions, {
+      socket = addr,
+      cwd = (info and info.cwd) or cwd_for_pid(pid) or "?",
+      pid = pid or "?",
+      started = info and info.startedAt or nil,
+      mtime = stat.mtime.sec,
+    })
+  end
+
+  -- Manifests first (they may carry the Windows pipe address), then any
+  -- socket that has no manifest at all.
+  local ok, infos = pcall(vim.fn.glob, sd .. "/*.info", false, true)
+  if ok and infos then
+    for _, info_path in ipairs(infos) do
+      add(info_path:sub(1, -6)) -- strip ".info"
+    end
+  end
+  local ok2, socks = pcall(vim.fn.glob, sd .. "/*.sock", false, true)
+  if ok2 and socks then
+    for _, sock_path in ipairs(socks) do
+      add(sock_path)
+    end
+  end
+
+  return sessions
+end
+
 --- Resolve the socket path to use.
 --- Priority: config override > cwd-based > latest symlink
 --- @return string|nil
@@ -83,42 +186,20 @@ function M.get_socket_path()
     return M.config.socket_path
   end
 
-  local sd = sockets_dir()
-  if not sd then return nil end
+  local sessions = M.discover_sessions()
   local cwd = vim.uv.cwd()
-
-  -- Scan the sockets directory for .info files
-  local ok, files = pcall(vim.fn.glob, sd .. "/*.info", false, true)
-  if ok and files then
-    -- Collect live sessions. The .sock file is a real unix socket on unix and
-    -- a liveness marker on Windows; the connect address always comes from the
-    -- manifest's "socket" field (falls back to the file-derived path).
-    local best_sock, best_mtime = nil, 0
-    local any_sock, any_mtime = nil, 0
-    for _, info_path in ipairs(files) do
-      local content_ok, content = pcall(vim.fn.readfile, info_path)
-      if content_ok and content and content[1] then
-        local parsed_ok, info = pcall(vim.json.decode, content[1])
-        if parsed_ok and info then
-          local sock_file = info_path:sub(1, -6) -- strip ".info"
-          local stat = vim.uv.fs_stat(sock_file)
-          local addr = info.socket or sock_file
-          if stat then
-            if stat.mtime.sec > any_mtime then
-              any_mtime = stat.mtime.sec
-              any_sock = addr
-            end
-            if info.cwd == cwd and stat.mtime.sec > best_mtime then
-              best_mtime = stat.mtime.sec
-              best_sock = addr
-            end
-          end
-        end
-      end
+  local best_sock, best_mtime
+  local any_sock, any_mtime
+  for _, s in ipairs(sessions) do
+    if s.cwd == cwd and (not best_mtime or s.mtime > best_mtime) then
+      best_sock, best_mtime = s.socket, s.mtime
     end
-    if best_sock then return best_sock end
-    if any_sock then return any_sock end
+    if not any_mtime or s.mtime > any_mtime then
+      any_sock, any_mtime = s.socket, s.mtime
+    end
   end
+  if best_sock then return best_sock end
+  if any_sock then return any_sock end
 
   -- Fall back to latest symlink (unix only; Windows has none)
   if vim.fn.has("win32") == 0 then
@@ -340,61 +421,25 @@ end
 
 --- List all running pi sessions.
 function M.list_sessions()
-  local sd = sockets_dir()
-  if not sd then
-    vim.notify("No pi sessions found", vim.log.levels.INFO)
-    return
-  end
-  local ok, files = pcall(vim.fn.glob, sd .. "/*.info", false, true)
-  if not ok or not files or #files == 0 then
-    vim.notify("No pi sessions found", vim.log.levels.INFO)
-    return
-  end
-
-  local sessions = {}
-  for _, info_path in ipairs(files) do
-    local content_ok, content = pcall(vim.fn.readfile, info_path)
-    if content_ok and content and content[1] then
-      local parsed_ok, info = pcall(vim.json.decode, content[1])
-      if parsed_ok and info then
-        local sock_file = info_path:sub(1, -6)
-        local alive = vim.uv.fs_stat(sock_file) ~= nil
-        if alive then
-          -- Format start time as relative or short time
-          local started = ""
-          if info.startedAt then
-            local ok2, ts = pcall(function()
-              -- Parse ISO 8601: "2026-03-01T14:10:09.123Z"
-              local y, mo, d, h, mi, s = info.startedAt:match("(%d+)-(%d+)-(%d+)T(%d+):(%d+):(%d+)")
-              if h and mi then
-                return string.format("%s:%s", h, mi)
-              end
-              return info.startedAt
-            end)
-            if ok2 then started = ts end
-          end
-          table.insert(sessions, {
-            cwd = info.cwd or "?",
-            pid = info.pid or "?",
-            started = started,
-            socket = info.socket or sock_file,
-          })
-        end
-      end
-    end
-  end
-
+  local sessions = M.discover_sessions()
   if #sessions == 0 then
     vim.notify("No pi sessions found", vim.log.levels.INFO)
     return
+  end
+
+  --- Format an ISO 8601 "...T14:10:09..." timestamp as " started 14:10".
+  local function short_time(iso)
+    if not iso then return "" end
+    local h, mi = iso:match("T(%d+):(%d+)")
+    if h and mi then return string.format(" started %s:%s", h, mi) end
+    return ""
   end
 
   local items = {}
   local current = M.get_socket_path()
   for _, s in ipairs(sessions) do
     local marker = (current == s.socket) and "●" or "○"
-    local time_str = s.started ~= "" and string.format(" started %s", s.started) or ""
-    table.insert(items, string.format("%s %s [pid %s%s]", marker, s.cwd, s.pid, time_str))
+    table.insert(items, string.format("%s %s [pid %s%s]", marker, s.cwd, s.pid, short_time(s.started)))
   end
 
   vim.ui.select(items, { prompt = "Pi sessions:" }, function(choice, idx)
