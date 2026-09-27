@@ -277,6 +277,123 @@ function M.send_raw(msg, cb)
   end)
 end
 
+-- ============================================================================
+-- RPC (namespaced request/response)
+-- ============================================================================
+
+local request_counter = 0
+
+--- @class pi_nvim.RpcError
+--- @field code string
+--- @field message string
+
+--- Perform a namespaced RPC request and call cb with (err, result).
+---
+--- `err` is a structured { code, message } table (nil on success).
+---
+--- A client timeout is NOT cancellation: when it fires, Neovim stops waiting
+--- and closes the connection, but the server may keep working. The result is
+--- discarded.
+---
+--- @param method string
+--- @param params table|nil
+--- @param cb fun(err: pi_nvim.RpcError|nil, result: any)
+--- @param opts { timeout?: integer }|nil  timeout in ms (default 120000)
+function M.request(method, params, cb, opts)
+  opts = opts or {}
+  local timeout = opts.timeout or 120000
+
+  local sock_path = M.get_socket_path()
+  if not sock_path then
+    cb({ code = "no_session", message = "No pi session found. Is pi running with pi-nvim extension?" })
+    return
+  end
+
+  request_counter = request_counter + 1
+  local id = string.format("%d-%d", vim.fn.getpid(), request_counter)
+
+  local client = vim.uv.new_pipe(false)
+  if not client then
+    cb({ code = "internal", message = "Failed to create pipe" })
+    return
+  end
+
+  local finished = false
+  local timer = vim.uv.new_timer()
+
+  local function finish(err, result)
+    if finished then return end
+    finished = true
+    if timer then
+      timer:stop()
+      timer:close()
+      timer = nil
+    end
+    pcall(function() client:close() end)
+    vim.schedule(function() cb(err, result) end)
+  end
+
+  local buf = ""
+
+  client:connect(sock_path, function(err)
+    if err then
+      finish({ code = "connect_failed", message = "Failed to connect to pi: " .. tostring(err) })
+      return
+    end
+
+    client:read_start(function(read_err, data)
+      if read_err then
+        finish({ code = "connection_closed", message = "pi socket read error: " .. tostring(read_err) })
+        return
+      end
+      if not data then
+        finish({ code = "connection_closed", message = "pi closed the connection before responding" })
+        return
+      end
+
+      buf = buf .. data
+      local nl = buf:find("\n")
+      if not nl then return end
+
+      local line = buf:sub(1, nl - 1)
+      client:read_stop()
+
+      local ok, resp = pcall(vim.json.decode, line)
+      if not ok or type(resp) ~= "table" then
+        finish({ code = "invalid_response", message = "Invalid response from pi" })
+      elseif resp.ok then
+        finish(nil, resp.result)
+      elseif type(resp.error) == "table" then
+        finish({ code = resp.error.code or "internal", message = resp.error.message or "unknown error" })
+      else
+        finish({ code = "internal", message = tostring(resp.error or "unknown error") })
+      end
+    end)
+
+    local payload = vim.json.encode({ id = id, type = "request", method = method, params = params or {} }) .. "\n"
+    client:write(payload)
+  end)
+
+  timer:start(timeout, 0, function()
+    finish({ code = "client_timeout", message = "Timed out waiting for pi (the request is not cancelled)" })
+  end)
+end
+
+--- Convenience wrapper for the "llm.complete" method.
+--- @param params { systemPrompt?: string, messages: table[], model?: { provider: string, id: string } }
+--- @param cb fun(err: pi_nvim.RpcError|nil, result: any)
+--- @param opts { timeout?: integer }|nil
+function M.complete(params, cb, opts)
+  M.request("llm.complete", params, cb, opts)
+end
+
+--- Convenience wrapper for the "rpc.capabilities" method.
+--- @param cb fun(err: pi_nvim.RpcError|nil, result: any)
+--- @param opts { timeout?: integer }|nil
+function M.capabilities(cb, opts)
+  M.request("rpc.capabilities", {}, cb, opts)
+end
+
 --- Send a prompt string to pi.
 --- @param message string|nil  If nil, prompts the user for input
 function M.prompt(message)
